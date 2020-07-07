@@ -1,10 +1,10 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from utils.region_loss import RegionLoss
-from utils.yolo_layer import YoloLayer
-from tool.cfg import *
+from tool.region_loss import RegionLoss
+from tool.yolo_layer import YoloLayer
+from tool.config import *
+from tool.torch_utils import *
 
 
 class Mish(torch.nn.Module):
@@ -16,26 +16,42 @@ class Mish(torch.nn.Module):
         return x
 
 
-class MaxPoolStride1(nn.Module):
-    def __init__(self, size=2):
-        super(MaxPoolStride1, self).__init__()
+class MaxPoolDark(nn.Module):
+    def __init__(self, size=2, stride=1):
+        super(MaxPoolDark, self).__init__()
         self.size = size
-        if (self.size - 1) % 2 == 0:
-            self.padding1 = (self.size - 1) // 2
-            self.padding2 = self.padding1
-        else:
-            self.padding1 = (self.size - 1) // 2
-            self.padding2 = self.padding1 + 1
+        self.stride = stride
 
     def forward(self, x):
-        x = F.max_pool2d(F.pad(x, (self.padding1, self.padding2, self.padding1, self.padding2), mode='replicate'),
-                         self.size, stride=1)
+        '''
+        darknet output_size = (input_size + p - k) / s +1
+        p : padding = k - 1
+        k : size
+        s : stride
+        torch output_size = (input_size + 2*p -k) / s +1
+        p : padding = k//2
+        '''
+        p = self.size // 2
+        if ((x.shape[2] - 1) // self.stride) != ((x.shape[2] + 2 * p - self.size) // self.stride):
+            padding1 = (self.size - 1) // 2
+            padding2 = padding1 + 1
+        else:
+            padding1 = (self.size - 1) // 2
+            padding2 = padding1
+        if ((x.shape[3] - 1) // self.stride) != ((x.shape[3] + 2 * p - self.size) // self.stride):
+            padding3 = (self.size - 1) // 2
+            padding4 = padding3 + 1
+        else:
+            padding3 = (self.size - 1) // 2
+            padding4 = padding3
+        x = F.max_pool2d(F.pad(x, (padding3, padding4, padding1, padding2), mode='replicate'),
+                         self.size, stride=self.stride)
         return x
 
 
-class Upsample(nn.Module):
+class Upsample_expand(nn.Module):
     def __init__(self, stride=2):
-        super(Upsample, self).__init__()
+        super(Upsample_expand, self).__init__()
         self.stride = stride
 
     def forward(self, x):
@@ -49,6 +65,23 @@ class Upsample(nn.Module):
         hs = stride
         x = x.view(B, C, H, 1, W, 1).expand(B, C, H, stride, W, stride).contiguous().view(B, C, H * stride, W * stride)
         return x
+
+
+class Upsample_interpolate(nn.Module):
+    def __init__(self, stride):
+        super(Upsample_interpolate, self).__init__()
+        self.stride = stride
+
+    def forward(self, x):
+        x_numpy = x.cpu().detach().numpy()
+        H = x_numpy.shape[2]
+        W = x_numpy.shape[3]
+
+        H = H * self.stride
+        W = W * self.stride
+
+        out = F.interpolate(x, size=(H, W), mode='nearest')
+        return out
 
 
 class Reorg(nn.Module):
@@ -99,14 +132,17 @@ class EmptyModule(nn.Module):
 
 # support route shortcut and reorg
 class Darknet(nn.Module):
-    def __init__(self, cfgfile):
+    def __init__(self, cfgfile, inference=False):
         super(Darknet, self).__init__()
-        self.blocks = parse_cfg(cfgfile)
-        self.models = self.create_network(self.blocks)  # merge conv, bn,leaky
-        self.loss = self.models[len(self.models) - 1]
+        self.inference = inference
+        self.training = not self.inference
 
+        self.blocks = parse_cfg(cfgfile)
         self.width = int(self.blocks[0]['width'])
         self.height = int(self.blocks[0]['height'])
+
+        self.models = self.create_network(self.blocks)  # merge conv, bn,leaky
+        self.loss = self.models[len(self.models) - 1]
 
         if self.blocks[(len(self.blocks) - 1)]['type'] == 'region':
             self.anchors = self.loss.anchors
@@ -136,8 +172,15 @@ class Darknet(nn.Module):
                 layers = block['layers'].split(',')
                 layers = [int(i) if int(i) > 0 else int(i) + ind for i in layers]
                 if len(layers) == 1:
-                    x = outputs[layers[0]]
-                    outputs[ind] = x
+                    if 'groups' not in block.keys() or int(block['groups']) == 1:
+                        x = outputs[layers[0]]
+                        outputs[ind] = x
+                    else:
+                        groups = int(block['groups'])
+                        group_id = int(block['group_id'])
+                        _, b, _, _ = outputs[layers[0]].shape
+                        x = outputs[layers[0]][:, b // groups * group_id:b // groups * (group_id + 1)]
+                        outputs[ind] = x
                 elif len(layers) == 2:
                     x1 = outputs[layers[0]]
                     x2 = outputs[layers[1]]
@@ -173,19 +216,22 @@ class Darknet(nn.Module):
                     self.loss = self.models[ind](x)
                 outputs[ind] = None
             elif block['type'] == 'yolo':
-                if self.training:
-                    pass
-                else:
-                    boxes = self.models[ind](x)
-                    out_boxes.append(boxes)
+                # if self.training:
+                #     pass
+                # else:
+                #     boxes = self.models[ind](x)
+                #     out_boxes.append(boxes)
+                boxes = self.models[ind](x)
+                out_boxes.append(boxes)
             elif block['type'] == 'cost':
                 continue
             else:
                 print('unknown type %s' % (block['type']))
+
         if self.training:
-            return loss
-        else:
             return out_boxes
+        else:
+            return get_region_boxes(out_boxes)
 
     def print_network(self):
         print_cfg(self.blocks)
@@ -237,10 +283,16 @@ class Darknet(nn.Module):
             elif block['type'] == 'maxpool':
                 pool_size = int(block['size'])
                 stride = int(block['stride'])
-                if stride > 1:
-                    model = nn.MaxPool2d(pool_size, stride)
+                if stride == 1 and pool_size % 2:
+                    # You can use Maxpooldark instead, here is convenient to convert onnx.
+                    # Example: [maxpool] size=3 stride=1
+                    model = nn.MaxPool2d(kernel_size=pool_size, stride=stride, padding=pool_size // 2)
+                elif stride == pool_size:
+                    # You can use Maxpooldark instead, here is convenient to convert onnx.
+                    # Example: [maxpool] size=2 stride=2
+                    model = nn.MaxPool2d(kernel_size=pool_size, stride=stride, padding=0)
                 else:
-                    model = MaxPoolStride1(pool_size)
+                    model = MaxPoolDark(pool_size, stride)
                 out_filters.append(prev_filters)
                 prev_stride = stride * prev_stride
                 out_strides.append(prev_stride)
@@ -276,17 +328,23 @@ class Darknet(nn.Module):
                 out_filters.append(prev_filters)
                 prev_stride = prev_stride // stride
                 out_strides.append(prev_stride)
-                # models.append(nn.Upsample(scale_factor=stride, mode='nearest'))
-                models.append(Upsample(stride))
+
+                models.append(Upsample_expand(stride))
+                # models.append(Upsample_interpolate(stride))
+
             elif block['type'] == 'route':
                 layers = block['layers'].split(',')
                 ind = len(models)
                 layers = [int(i) if int(i) > 0 else int(i) + ind for i in layers]
                 if len(layers) == 1:
-                    prev_filters = out_filters[layers[0]]
-                    prev_stride = out_strides[layers[0]]
+                    if 'groups' not in block.keys() or int(block['groups']) == 1:
+                        prev_filters = out_filters[layers[0]]
+                        prev_stride = out_strides[layers[0]]
+                    else:
+                        prev_filters = out_filters[layers[0]] // int(block['groups'])
+                        prev_stride = out_strides[layers[0]] // int(block['groups'])
                 elif len(layers) == 2:
-                    assert (layers[0] == ind - 1)
+                    assert (layers[0] == ind - 1 or layers[1] == ind - 1)
                     prev_filters = out_filters[layers[0]] + out_filters[layers[1]]
                     prev_stride = out_strides[layers[0]]
                 elif len(layers) == 4:
@@ -344,9 +402,11 @@ class Darknet(nn.Module):
                 yolo_layer.anchor_mask = [int(i) for i in anchor_mask]
                 yolo_layer.anchors = [float(i) for i in anchors]
                 yolo_layer.num_classes = int(block['classes'])
+                self.num_classes = yolo_layer.num_classes
                 yolo_layer.num_anchors = int(block['num'])
                 yolo_layer.anchor_step = len(yolo_layer.anchors) // yolo_layer.num_anchors
                 yolo_layer.stride = prev_stride
+                yolo_layer.scale_x_y = float(block['scale_x_y'])
                 # yolo_layer.object_scale = float(block['object_scale'])
                 # yolo_layer.noobject_scale = float(block['noobject_scale'])
                 # yolo_layer.class_scale = float(block['class_scale'])

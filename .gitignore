@@ -1,9 +1,19 @@
 ttest
 *.weights
 *.pth
+*.onnx
+*.engine
+*.pyc
+*.infer
+*.npy
+
+z_demo_*
 
 __pycache__
 .idea
+.vscode
 runs
+log
 
-predictions.jpg
+*.jpg
+data/outcome
